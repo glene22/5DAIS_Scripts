@@ -65,42 +65,6 @@ def read_and_align(gt_path, clf_path):
 
     return gt.astype(np.int16), cl_on_gt.astype(np.int16), valid
 
-def read_and_align_mosaic(gt_path, clf_paths):
-    # Reprojects each classified tile onto the GT grid and mosaics them
-    with rasterio.open(gt_path) as gt_ds:
-        gt = gt_ds.read(1)
-        gt_nodata = gt_ds.nodata
-        gt_transform = gt_ds.transform
-        gt_crs = gt_ds.crs
-        gt_shape = gt_ds.shape
-
-    temp_nodata = np.int16(-32768)
-    cl_on_gt = np.full(gt_shape, temp_nodata, dtype=np.int16)
-
-    for p in clf_paths:
-        with rasterio.open(p) as cl_ds:
-            tmp = np.full(gt_shape, temp_nodata, dtype=np.int16)
-            reproject(
-                source=cl_ds.read(1),
-                destination=tmp,
-                src_transform=cl_ds.transform,
-                src_crs=cl_ds.crs,
-                dst_transform=gt_transform,
-                dst_crs=gt_crs,
-                resampling=Resampling.nearest,
-                dst_nodata=temp_nodata
-            )
-        fill = (cl_on_gt == temp_nodata) & (tmp != temp_nodata)
-        cl_on_gt[fill] = tmp[fill]
-
-    valid = np.ones(gt_shape, dtype=bool)
-    if gt_nodata is not None:
-        valid &= (gt != gt_nodata)
-    valid &= (cl_on_gt != temp_nodata)
-    valid &= np.isfinite(gt) & np.isfinite(cl_on_gt)
-
-    return gt.astype(np.int16), cl_on_gt.astype(np.int16), valid
-
 def sample_pixels_stratified(gt, pred, valid, n_samples_total, classes):
     """Evenly sample pixels from each class in GT."""
     per_class = n_samples_total // len(classes)
@@ -230,42 +194,21 @@ def main():
     if not files:
         print(f"No GT files in {GT_DIR}")
         return
-    
 
     for gt_path in files:
         name = os.path.basename(gt_path).replace(".tif", "")
-
-        if "Abbott" in name:
-            # find both Abbott tiles, e.g. ...-0000000000-0000000000.tif etc.
-            abbott_tiles = sorted(glob.glob(os.path.join(
-                CLF_DIR, "Classified_cld_Abbott_1_1-*.tif"
-            )))
-            if not abbott_tiles:
-                # fallback just in case naming changes
-                fallback = find_classified_partner(gt_path)
-                abbott_tiles = [fallback] if fallback else []
-            if not abbott_tiles:
-                print(f"[WARN] No Classified tiles for {name}")
-                continue
-
-            print(f"{name}: mosaicking {len(abbott_tiles)} classified tiles")
-            gt_arr, cl_arr, valid = read_and_align_mosaic(gt_path, abbott_tiles)
-            clf_desc = ", ".join(os.path.basename(p) for p in abbott_tiles)
-
-        else:
-            clf_path = find_classified_partner(gt_path)
-            if not clf_path:
-                print(f"[WARN] No Classified match for {name}")
-                continue
-            gt_arr, cl_arr, valid = read_and_align(gt_path, clf_path)
-            clf_desc = os.path.basename(clf_path)
-
-        # (rest of your loop unchanged)
-        vcount = int(np.count_nonzero(valid))
-        if vcount == 0:
-            print(f"[WARN] {name}: 0 valid pixels")
+        clf_path = find_classified_partner(gt_path)
+        if not clf_path:
+            print(f"[WARN] No Classified match for {name}")
             continue
 
+        gt_arr, cl_arr, valid = read_and_align(gt_path, clf_path)
+        vcount = int(np.count_nonzero(valid))
+        print(f"{name}: {vcount} valid pixels")
+        if vcount == 0:
+            continue
+
+        # stratified sample for metrics
         gt_s, cl_s = sample_pixels_stratified(gt_arr, cl_arr, valid, SAMPLE_SIZE, CLASSES)
         if gt_s.size == 0:
             print(f"[WARN] No samples for {name}")
@@ -273,12 +216,11 @@ def main():
 
         cm, metrics = compute_metrics(gt_s, cl_s, CLASSES)
         png_path = plot_triptych(name, gt_arr, cl_arr, FIG_DIR, metrics)
-        print(f"[OK] {name}: Acc={metrics['Accuracy']:.3f}, mIoU={metrics['Mean_IoU']:.3f} → {png_path}")
+        print(f"[OK] {name}: Acc={metrics['Accuracy']:.3f}, mIoU={metrics['Mean_IoU']:.3f}  →  {png_path}")
 
-        row = {"Pair": f"{os.path.basename(gt_path)} vs {clf_desc}"}
+        row = {"Pair": f"{os.path.basename(gt_path)} vs {os.path.basename(clf_path)}"}
         row.update(metrics)
         rows.append(row)
-
 
     if rows:
         df = pd.DataFrame(rows)
