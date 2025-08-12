@@ -7,6 +7,7 @@ from rasterio.warp import reproject, Resampling
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, BoundaryNorm
 from math import ceil
+import itertools
 
 # --- EDIT THESE ---
 GT_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/GT_masks"
@@ -65,6 +66,43 @@ def read_and_align(gt_path, clf_path):
 
     return gt.astype(np.int16), cl_on_gt.astype(np.int16), valid
 
+def read_and_align_mosaic(gt_path, clf_paths):
+    # Reprojects each classified tile onto the GT grid and mosaics them
+    with rasterio.open(gt_path) as gt_ds:
+        gt = gt_ds.read(1)
+        gt_nodata = gt_ds.nodata
+        gt_transform = gt_ds.transform
+        gt_crs = gt_ds.crs
+        gt_shape = gt_ds.shape
+
+    temp_nodata = np.int16(-32768)
+    cl_on_gt = np.full(gt_shape, temp_nodata, dtype=np.int16)
+
+    for p in clf_paths:
+        with rasterio.open(p) as cl_ds:
+            tmp = np.full(gt_shape, temp_nodata, dtype=np.int16)
+            reproject(
+                source=cl_ds.read(1),
+                destination=tmp,
+                src_transform=cl_ds.transform,
+                src_crs=cl_ds.crs,
+                dst_transform=gt_transform,
+                dst_crs=gt_crs,
+                resampling=Resampling.nearest,
+                dst_nodata=temp_nodata
+            )
+        # Mosaic rule: fill previously empty (nodata) with new non-nodata
+        fill = (cl_on_gt == temp_nodata) & (tmp != temp_nodata)
+        cl_on_gt[fill] = tmp[fill]
+
+    valid = np.ones(gt_shape, dtype=bool)
+    if gt_nodata is not None:
+        valid &= (gt != gt_nodata)
+    valid &= (cl_on_gt != temp_nodata)
+    valid &= np.isfinite(gt) & np.isfinite(cl_on_gt)
+
+    return gt.astype(np.int16), cl_on_gt.astype(np.int16), valid
+
 def sample_pixels_stratified(gt, pred, valid, n_samples_total, classes):
     """Evenly sample pixels from each class in GT."""
     per_class = n_samples_total // len(classes)
@@ -108,14 +146,27 @@ def compute_metrics(gt, pred, classes):
     total = cm.sum()
     acc = np.trace(cm) / total if total else np.nan
     mean_iou = float(np.mean(ious))
+    meltwater_iou = np.mean([ious[i] for i, c in enumerate(classes) if c in (1, 2)])
     pe = np.sum(np.sum(cm, axis=0) * np.sum(cm, axis=1)) / (total**2) if total else 0
     kappa = (acc - pe) / (1 - pe) if (1 - pe) else np.nan
 
-    metrics = {"Accuracy": acc, "Mean_IoU": mean_iou, "Kappa": kappa}
+    # Per-class % in GT and prediction (over sampled set)
+    gt_perc = [np.sum(gt == c) / total for c in classes]
+    pred_perc = [np.sum(pred == c) / total for c in classes]
+
+    metrics = {
+        "Accuracy": acc,
+        "Mean_IoU": mean_iou,
+        "Meltwater_mIoU": meltwater_iou,
+        "Kappa": kappa
+    }
     for k, cls in enumerate(classes):
+        metrics[f"GT_pct_class{cls}"] = gt_perc[k]
+        metrics[f"Pred_pct_class{cls}"] = pred_perc[k]
         metrics[f"Prec_class{cls}"] = precisions[k]
         metrics[f"Rec_class{cls}"]  = recalls[k]
         metrics[f"F1_class{cls}"]   = f1s[k]
+        metrics[f"IoU_class{cls}"]  = ious[k]
     return cm, metrics
 
 def downsample_for_plot(a, max_side=2000):
@@ -179,13 +230,38 @@ def plot_triptych(name, gt, pred, outdir, metrics):
                    for k in range(7)]
     axes[2].legend(err_handles, err_labels, loc="lower left", fontsize=8, frameon=True)
 
-    fig.suptitle(f"{name}  |  Acc={metrics['Accuracy']:.3f}  mIoU={metrics['Mean_IoU']:.3f}  Kappa={metrics['Kappa']:.3f}",
+    fig.suptitle(f"{name}  |  Acc={metrics['Accuracy']:.3f}  mIoU={metrics['Mean_IoU']:.3f}  Kappa={metrics['Kappa']:.3f}  Melt mIoU={metrics['Meltwater_mIoU']:.3f}",
                  fontsize=12)
 
     png_path = os.path.join(outdir, f"{name}_comparison.png")
     fig.savefig(png_path, bbox_inches="tight")
     plt.close(fig)
     return png_path
+
+def plot_confusion_matrix(cm, classes, normalize=False, title='Confusion matrix', outpath=None):
+    if normalize:
+        row_sums = cm.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1
+        cm = cm.astype('float') / row_sums
+    fig, ax = plt.subplots(figsize=(5, 5), dpi=DPI)
+    im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+    ax.figure.colorbar(im, ax=ax)
+    ax.set(xticks=np.arange(len(classes)),
+           yticks=np.arange(len(classes)),
+           xticklabels=classes, yticklabels=classes,
+           title=title,
+           ylabel='True label',
+           xlabel='Predicted label')
+    fmt = '.2f' if normalize else 'd'
+    thresh = cm.max() / 2.
+    for i, j in itertools.product(range(cm.shape[0]), range(cm.shape[1])):
+        ax.text(j, i, format(cm[i, j], fmt),
+                ha="center", va="center",
+                color="white" if cm[i, j] > thresh else "black")
+    fig.tight_layout()
+    if outpath:
+        fig.savefig(outpath, bbox_inches="tight")
+    plt.close(fig)
 
 def main():
     np.random.seed(42)
@@ -197,28 +273,51 @@ def main():
 
     for gt_path in files:
         name = os.path.basename(gt_path).replace(".tif", "")
-        clf_path = find_classified_partner(gt_path)
-        if not clf_path:
-            print(f"[WARN] No Classified match for {name}")
-            continue
 
-        gt_arr, cl_arr, valid = read_and_align(gt_path, clf_path)
+        if "Abbott" in name:
+            # one-off: tile/mosaic Abbott classified pieces before comparison
+            abbott_tiles = sorted(glob.glob(os.path.join(
+                CLF_DIR, "Classified_cld_Abbott_1_1-*.tif"
+            )))
+            if not abbott_tiles:
+                fallback = find_classified_partner(gt_path)
+                abbott_tiles = [fallback] if fallback else []
+            if not abbott_tiles:
+                print(f"[WARN] No Classified tiles for {name}")
+                continue
+            print(f"{name}: mosaicking {len(abbott_tiles)} classified tiles")
+            gt_arr, cl_arr, valid = read_and_align_mosaic(gt_path, abbott_tiles)
+            clf_desc = ", ".join(os.path.basename(p) for p in abbott_tiles)
+        else:
+            clf_path = find_classified_partner(gt_path)
+            if not clf_path:
+                print(f"[WARN] No Classified match for {name}")
+                continue
+            gt_arr, cl_arr, valid = read_and_align(gt_path, clf_path)
+            clf_desc = os.path.basename(clf_path)
+
         vcount = int(np.count_nonzero(valid))
-        print(f"{name}: {vcount} valid pixels")
         if vcount == 0:
+            print(f"[WARN] {name}: 0 valid pixels")
             continue
 
-        # stratified sample for metrics
+        # Stratified sampling (class-balanced) for fair metrics
         gt_s, cl_s = sample_pixels_stratified(gt_arr, cl_arr, valid, SAMPLE_SIZE, CLASSES)
         if gt_s.size == 0:
             print(f"[WARN] No samples for {name}")
             continue
 
         cm, metrics = compute_metrics(gt_s, cl_s, CLASSES)
-        png_path = plot_triptych(name, gt_arr, cl_arr, FIG_DIR, metrics)
-        print(f"[OK] {name}: Acc={metrics['Accuracy']:.3f}, mIoU={metrics['Mean_IoU']:.3f}  →  {png_path}")
 
-        row = {"Pair": f"{os.path.basename(gt_path)} vs {os.path.basename(clf_path)}"}
+        # Export figures
+        triptych_path = plot_triptych(name, gt_arr, cl_arr, FIG_DIR, metrics)
+        cm_fig_path = os.path.join(FIG_DIR, f"{name}_confusion_matrix.png")
+        plot_confusion_matrix(cm, [CLASS_LABELS[c] for c in CLASSES], normalize=True,
+                              title=f"{name} Confusion Matrix (Normalized)", outpath=cm_fig_path)
+
+        print(f"[OK] {name}: Acc={metrics['Accuracy']:.3f}, mIoU={metrics['Mean_IoU']:.3f}, Meltwater mIoU={metrics['Meltwater_mIoU']:.3f} → {triptych_path}, {cm_fig_path}")
+
+        row = {"Pair": f"{os.path.basename(gt_path)} vs {clf_desc}"}
         row.update(metrics)
         rows.append(row)
 
