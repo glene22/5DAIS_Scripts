@@ -335,8 +335,8 @@ def plot_triptych(scene_tag, gt, pred, outdir, metrics, src_crs, src_transform, 
     )
 
     png_path = os.path.join(outdir, f"triptych_{scene_tag}.png")
-    fig.savefig(png_path, bbox_inches="tight")
-    plt.close(fig)
+    # fig.savefig(png_path, bbox_inches="tight")
+    # plt.close(fig)
 
     # ----- cropped scene -----
     zoom_png = None
@@ -406,8 +406,8 @@ def plot_confusion_matrix(cm, class_names, title, outpath):
         ax.text(j, i, f"{cm[i, j]:,d}", ha="center", va="center",
                 color="white" if cm[i, j] > thresh else "black")
     fig.tight_layout()
-    fig.savefig(outpath, bbox_inches="tight")
-    plt.close(fig)
+    # fig.savefig(outpath, bbox_inches="tight")
+    # plt.close(fig)
 
 
 def main():
@@ -508,7 +508,7 @@ def main():
             row_full[f"RelErr_class{c}"] = float(rel_err[i]) if np.isfinite(rel_err[i]) else np.nan
         for ti, tc in enumerate(CLASSES):
             for pj, pc in enumerate(CLASSES):
-                row_full[f"CM_t{tc}_p{pc}"] = int(full_cm[ti, pj])
+                row_full[f"CM_strat_t{tc}_p{pc}"] = int(sample_cm[ti, pj])
         rows_full.append(row_full)
 
         # ===================== MELTWATER-ONLY =====================

@@ -2,7 +2,7 @@ import zipfile
 import os
 
 # Path to your ZIP file
-zip_path = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/Classified_masks_cld-20250812T093346Z-1-001.zip"
+zip_path = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/Masks/Classified_NEW-20250813T095105Z-1-001.zip"
 
 
 
