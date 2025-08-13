@@ -10,8 +10,8 @@ from math import ceil
 import itertools
 
 # --- EDIT THESE ---
-GT_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/GT_masks"
-CLF_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/Classified_masks_cld"
+GT_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/Masks/GT_masks_NEW"
+CLF_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/Masks/Classified_NEW"
 OUT_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/csv"  # new: directory for CSVs
 FIG_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/comparison_figures"
 CLASSES = [0, 1, 2]                     # 0=background, 1=slush, 2=lake (keep origin)
@@ -120,24 +120,33 @@ def read_and_align_mosaic(gt_path, clf_paths):
 
 
 def sample_pixels_stratified(gt, pred, valid, samples_per_class, classes):
-    """Sample up to 'samples_per_class' pixels per class from valid GT."""
+    """
+    Evenly sample exactly `samples_per_class` pixels per class from valid GT.
+    Uses sampling WITH replacement when a class has fewer pixels than requested.
+    If a class is absent in GT for this scene, it contributes zero samples.
+    """
+    # independent RNG (doesn't rely on global np.random seed)
+    rng = np.random.default_rng(42)
+
     gt_samples, pred_samples = [], []
     for cls in classes:
         y, x = np.where(valid & (gt == cls))
         total = len(y)
         if total == 0:
+            # Class absent in GT: skip; will become a zero row/col in CM.
             continue
-        take = min(total, samples_per_class)
-        if total > take:
-            idx = np.random.randint(0, total, size=take)
-        else:
-            idx = np.arange(total)
+
+        # choose indices WITH replacement if needed
+        idx = rng.choice(total, size=samples_per_class, replace=(total < samples_per_class))
         gt_samples.append(gt[y[idx], x[idx]])
         pred_samples.append(pred[y[idx], x[idx]])
+
     if gt_samples:
         return np.concatenate(gt_samples), np.concatenate(pred_samples)
     else:
-        return np.array([]), np.array([])
+        # no valid samples at all
+        return np.array([], dtype=gt.dtype), np.array([], dtype=pred.dtype)
+
 
 
 def compute_cm(gt, pred, classes, valid_mask=None):
