@@ -12,10 +12,11 @@ import itertools
 # --- EDIT THESE ---
 GT_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/Masks/GT_masks_NEW"
 CLF_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/Masks/Classified_NEW"
-OUT_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/csv"  # new: directory for CSVs
+TCC_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/Masks/TCC"  # NEW: RGB folder
+OUT_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/csv"       # directory for CSVs
 FIG_DIR = "/home/glene/luna/CPOM/glene/PostDoc/5DAIS/Methods/ML/GEE/comparison_figures"
-CLASSES = [0, 1, 2]                     # 0=background, 1=slush, 2=lake (keep origin)
-CLASS_LABELS = {0:"Background", 1:"Slush", 2:"Lake"}
+CLASSES = [0, 1, 2]                     # 0=background, 1=slush, 2=lake
+CLASS_LABELS = {0: "Background", 1: "Slush", 2: "Lake"}
 SAMPLES_PER_CLASS = 50000               # cap per class for metrics sampling
 MAX_PLOT_SIZE = 2000
 DPI = 200
@@ -31,7 +32,7 @@ ZOOM_PAD = 100                           # extra pixels around hotspot window
 os.makedirs(FIG_DIR, exist_ok=True)
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# derived CSV paths (requested)
+# derived CSV paths
 OUT_CSV_FULL = os.path.join(OUT_DIR, "metrics_fullscene.csv")
 OUT_CSV_MW   = os.path.join(OUT_DIR, "metrics_meltwateronly.csv")
 
@@ -125,28 +126,20 @@ def sample_pixels_stratified(gt, pred, valid, samples_per_class, classes):
     Uses sampling WITH replacement when a class has fewer pixels than requested.
     If a class is absent in GT for this scene, it contributes zero samples.
     """
-    # independent RNG (doesn't rely on global np.random seed)
     rng = np.random.default_rng(42)
-
     gt_samples, pred_samples = [], []
     for cls in classes:
         y, x = np.where(valid & (gt == cls))
         total = len(y)
         if total == 0:
-            # Class absent in GT: skip; will become a zero row/col in CM.
             continue
-
-        # choose indices WITH replacement if needed
         idx = rng.choice(total, size=samples_per_class, replace=(total < samples_per_class))
         gt_samples.append(gt[y[idx], x[idx]])
         pred_samples.append(pred[y[idx], x[idx]])
-
     if gt_samples:
         return np.concatenate(gt_samples), np.concatenate(pred_samples)
     else:
-        # no valid samples at all
         return np.array([], dtype=gt.dtype), np.array([], dtype=pred.dtype)
-
 
 
 def compute_cm(gt, pred, classes, valid_mask=None):
@@ -202,12 +195,13 @@ def metrics_from_sample(gt_s, pred_s, classes):
 
 
 def downsample_for_plot(a, max_side=2000):
-    h, w = a.shape
+    """Downsample 2D or 3D arrays for plotting."""
+    h, w = a.shape[:2]
     scale = max(h, w)
     if scale <= max_side:
         return a
     stride = ceil(scale / max_side)
-    return a[::stride, ::stride]
+    return a[::stride, ::stride] if a.ndim == 2 else a[::stride, ::stride, :]
 
 
 def make_colormaps():
@@ -221,12 +215,12 @@ def make_colormaps():
 
 def build_error_map(gt, pred):
     err = np.zeros_like(gt, dtype=np.uint8)
-    err[(gt==0) & (pred==1)] = 1
-    err[(gt==0) & (pred==2)] = 2
-    err[(gt==1) & (pred==0)] = 3
-    err[(gt==1) & (pred==2)] = 4
-    err[(gt==2) & (pred==0)] = 5
-    err[(gt==2) & (pred==1)] = 6
+    err[(gt == 0) & (pred == 1)] = 1
+    err[(gt == 0) & (pred == 2)] = 2
+    err[(gt == 1) & (pred == 0)] = 3
+    err[(gt == 1) & (pred == 2)] = 4
+    err[(gt == 2) & (pred == 0)] = 5
+    err[(gt == 2) & (pred == 1)] = 6
     return err
 
 
@@ -262,21 +256,17 @@ def reproject_arrays_to_crs(arr_list, src_crs, src_transform, src_shape, dst_crs
     return dst_arrays, dst_transform, dst_width, dst_height
 
 
-# --------- NEW: Hotspot finder for zoom ---------
+# --------- Hotspot finder for zoom ---------
 def find_hotspot_bbox(mask: np.ndarray, win_h: int, win_w: int, pad: int = 0):
-    """
-    Return (y0,y1,x0,x1) for the window with the maximum sum of True pixels.
-    Uses an integral image so it's fast even for big rasters.
-    """
+    """Return (y0,y1,x0,x1) for the window with the maximum sum of True pixels."""
     h, w = mask.shape
     win_h = min(win_h, h)
     win_w = min(win_w, w)
     # integral image
     S = np.zeros((h+1, w+1), dtype=np.int64)
-    S[1:,1:] = np.cumsum(np.cumsum(mask.astype(np.int32), axis=0), axis=1)
+    S[1:, 1:] = np.cumsum(np.cumsum(mask.astype(np.int32), axis=0), axis=1)
     # possible top-left coords
     if (h - win_h + 1) <= 0 or (w - win_w + 1) <= 0:
-        # window is whole image
         y0, x0 = 0, 0
     else:
         y_idx = np.arange(0, h - win_h + 1)
@@ -293,39 +283,96 @@ def find_hotspot_bbox(mask: np.ndarray, win_h: int, win_w: int, pad: int = 0):
     return y0, y1, x0, x1
 
 
+def _rgb_to_uint8_for_display(rgb_float):
+    """
+    Robustly scale a float32 RGB image to uint8 for imshow.
+    Uses a global 99th-percentile stretch across all channels.
+    """
+    if rgb_float.size == 0:
+        return rgb_float  # safety
+    rgb = rgb_float.astype(np.float32)
+    p99 = np.percentile(rgb, 99)
+    if not np.isfinite(p99) or p99 <= 0:
+        p99 = 255.0
+    rgb = np.clip(rgb / p99 * 255.0, 0, 255).astype(np.uint8)
+    return rgb
+
+
 def plot_triptych(scene_tag, gt, pred, outdir, metrics, src_crs, src_transform, src_shape,
-                  save_zoom=SAVE_ZOOM, zoom_mode=ZOOM_MODE, zoom_frac=ZOOM_FRAC, zoom_pad=ZOOM_PAD):
-    """Reproject GT and prediction to EPSG:3031 for plotting (figures only), then render triptych (+ optional crop)."""
+                  save_zoom=SAVE_ZOOM, zoom_mode=ZOOM_MODE, zoom_frac=ZOOM_FRAC, zoom_pad=ZOOM_PAD,
+                  tcc_dir=TCC_DIR):
+    """
+    Reproject GT/Pred/Err to EPSG:3031 (one common grid), optionally add matching RGB on the SAME grid,
+    then plot full-scene and optional zoom triptychs (with RGB as first panel when available).
+    """
     err_src = build_error_map(gt, pred)
 
-    (gt_ps, pred_ps, err_ps), _, _, _ = reproject_arrays_to_crs(
+    # Reproject GT/Pred/Err to plotting CRS; keep the target grid to reuse for RGB
+    (gt_ps, pred_ps, err_ps), dst_transform, dst_w, dst_h = reproject_arrays_to_crs(
         [gt, pred, err_src], src_crs, src_transform, src_shape, PLOT_CRS
     )
+
+    # Try to load matching RGB and reproject it to the SAME grid as GT/Pred/Err
+    rgb_ps = None
+    if tcc_dir:
+        rgb_candidates = sorted(glob.glob(os.path.join(tcc_dir, f"RGB_RAW_{scene_tag}*.tif")))
+        if rgb_candidates:
+            try:
+                with rasterio.open(rgb_candidates[0]) as rgb_ds:
+                    rgb_src = rgb_ds.read([1, 2, 3]).astype(np.float32)  # (3, H, W)
+                    rgb_ps = np.zeros((dst_h, dst_w, 3), dtype=np.float32)
+                    for b in range(3):
+                        reproject(
+                            source=rgb_src[b, ...],
+                            destination=rgb_ps[..., b],
+                            src_transform=rgb_ds.transform,
+                            src_crs=rgb_ds.crs,
+                            dst_transform=dst_transform,
+                            dst_crs=PLOT_CRS,
+                            resampling=Resampling.bilinear,
+                            dst_nodata=0
+                        )
+                    rgb_ps = _rgb_to_uint8_for_display(rgb_ps)
+            except Exception as e:
+                print(f"[WARN] Could not load/reproject TCC RGB for {scene_tag}: {e}")
+                rgb_ps = None
 
     (cls_cmap, cls_norm), (err_cmap, err_norm, err_labels) = make_colormaps()
     gt_d   = downsample_for_plot(gt_ps, MAX_PLOT_SIZE)
     pred_d = downsample_for_plot(pred_ps, MAX_PLOT_SIZE)
     err_d  = downsample_for_plot(err_ps, MAX_PLOT_SIZE)
+    if rgb_ps is not None:
+        rgb_d = downsample_for_plot(rgb_ps, MAX_PLOT_SIZE)
 
     # ----- full scene -----
-    fig, axes = plt.subplots(1, 3, figsize=(15, 5), dpi=DPI, constrained_layout=True)
-    axes[0].imshow(gt_d, cmap=cls_cmap, norm=cls_norm, interpolation='nearest')
-    axes[0].set_title("Ground Truth"); axes[0].axis('off')
-    axes[1].imshow(pred_d, cmap=cls_cmap, norm=cls_norm, interpolation='nearest')
-    axes[1].set_title("Prediction"); axes[1].axis('off')
-    axes[2].imshow(err_d, cmap=err_cmap, norm=err_norm, interpolation='nearest')
-    axes[2].set_title("Error Map"); axes[2].axis('off')
+    ncols = 4 if rgb_ps is not None else 3
+    fig, axes = plt.subplots(1, ncols, figsize=(5 * ncols, 5), dpi=DPI, constrained_layout=True)
 
-    class_handles = [plt.Line2D([0],[0], marker='s', linestyle='',
+    col = 0
+    if rgb_ps is not None:
+        axes[col].imshow(rgb_d); axes[col].set_title("RGB"); axes[col].axis('off'); col += 1
+
+    gt_ax_i = col
+    axes[col].imshow(gt_d, cmap=cls_cmap, norm=cls_norm, interpolation='nearest')
+    axes[col].set_title("Ground Truth"); axes[col].axis('off'); col += 1
+
+    axes[col].imshow(pred_d, cmap=cls_cmap, norm=cls_norm, interpolation='nearest')
+    axes[col].set_title("Prediction"); axes[col].axis('off'); col += 1
+
+    err_ax_i = col
+    axes[col].imshow(err_d, cmap=err_cmap, norm=err_norm, interpolation='nearest')
+    axes[col].set_title("Error Map"); axes[col].axis('off')
+
+    class_handles = [plt.Line2D([0], [0], marker='s', linestyle='',
                                  markerfacecolor=cls_cmap(k), markeredgecolor='k')
                      for k in range(len(CLASSES))]
     class_labels = [CLASS_LABELS.get(k, f"Class {k}") for k in CLASSES]
-    axes[0].legend(class_handles, class_labels, loc="lower left", fontsize=8, frameon=True)
+    axes[gt_ax_i].legend(class_handles, class_labels, loc="lower left", fontsize=8, frameon=True)
 
-    err_handles = [plt.Line2D([0],[0], marker='s', linestyle='',
+    err_handles = [plt.Line2D([0], [0], marker='s', linestyle='',
                                markerfacecolor=err_cmap(k), markeredgecolor='k')
                    for k in range(7)]
-    axes[2].legend(err_handles, err_labels, loc="lower left", fontsize=8, frameon=True)
+    axes[err_ax_i].legend(err_handles, err_labels, loc="lower left", fontsize=8, frameon=True)
 
     fig.suptitle(
         f"{scene_tag}  |  Accuracy={metrics['Accuracy']:.3f}  "
@@ -340,41 +387,52 @@ def plot_triptych(scene_tag, gt, pred, outdir, metrics, src_crs, src_transform, 
 
     # ----- cropped scene -----
     zoom_png = None
-    if save_zoom:
-        if zoom_mode == "meltwater":
+    if SAVE_ZOOM:
+        if ZOOM_MODE == "meltwater":
             focus = (gt_ps == 1) | (gt_ps == 2)
-        elif zoom_mode == "pred_meltwater":
+        elif ZOOM_MODE == "pred_meltwater":
             focus = (pred_ps == 1) | (pred_ps == 2)
-        elif zoom_mode == "error":
+        elif ZOOM_MODE == "error":
             focus = (err_ps > 0)
-        elif zoom_mode == "nonbg":
+        elif ZOOM_MODE == "nonbg":
             focus = (gt_ps != 0)
         else:
             focus = (gt_ps != 0)
 
         if np.any(focus):
             H, W = focus.shape
-            win = int(max(1, zoom_frac * min(H, W)))
-            y0, y1, x0, x1 = find_hotspot_bbox(focus, win, win, pad=zoom_pad)
+            win = int(max(1, ZOOM_FRAC * min(H, W)))
+            y0, y1, x0, x1 = find_hotspot_bbox(focus, win, win, pad=ZOOM_PAD)
 
             gt_c   = gt_ps[y0:y1, x0:x1]
             pred_c = pred_ps[y0:y1, x0:x1]
             err_c  = err_ps[y0:y1, x0:x1]
+            if rgb_ps is not None:
+                rgb_c = rgb_ps[y0:y1, x0:x1, :]
 
             gt_cd   = downsample_for_plot(gt_c, MAX_PLOT_SIZE)
             pred_cd = downsample_for_plot(pred_c, MAX_PLOT_SIZE)
             err_cd  = downsample_for_plot(err_c, MAX_PLOT_SIZE)
+            if rgb_ps is not None:
+                rgb_cd = downsample_for_plot(rgb_c, MAX_PLOT_SIZE)
 
-            fig2, ax2 = plt.subplots(1, 3, figsize=(15, 5), dpi=DPI, constrained_layout=True)
-            ax2[0].imshow(gt_cd, cmap=cls_cmap, norm=cls_norm, interpolation='nearest')
-            ax2[0].set_title("Ground Truth"); ax2[0].axis('off')
-            ax2[1].imshow(pred_cd, cmap=cls_cmap, norm=cls_norm, interpolation='nearest')
-            ax2[1].set_title("Prediction"); ax2[1].axis('off')
-            ax2[2].imshow(err_cd, cmap=err_cmap, norm=err_norm, interpolation='nearest')
-            ax2[2].set_title("Error Map"); ax2[2].axis('off')
+            ncols2 = 4 if rgb_ps is not None else 3
+            fig2, ax2 = plt.subplots(1, ncols2, figsize=(5 * ncols2, 5), dpi=DPI, constrained_layout=True)
 
-            ax2[0].legend(class_handles, class_labels, loc="lower left", fontsize=8, frameon=True)
-            ax2[2].legend(err_handles, err_labels, loc="lower left", fontsize=8, frameon=True)
+            j = 0
+            if rgb_ps is not None:
+                ax2[j].imshow(rgb_cd); ax2[j].set_title("RGB"); ax2[j].axis('off'); j += 1
+            gt_ax2_i = j
+            ax2[j].imshow(gt_cd, cmap=cls_cmap, norm=cls_norm, interpolation='nearest')
+            ax2[j].set_title("Ground Truth"); ax2[j].axis('off'); j += 1
+            ax2[j].imshow(pred_cd, cmap=cls_cmap, norm=cls_norm, interpolation='nearest')
+            ax2[j].set_title("Prediction"); ax2[j].axis('off'); j += 1
+            err_ax2_i = j
+            ax2[j].imshow(err_cd, cmap=err_cmap, norm=err_norm, interpolation='nearest')
+            ax2[j].set_title("Error Map"); ax2[j].axis('off')
+
+            ax2[gt_ax2_i].legend(class_handles, class_labels, loc="lower left", fontsize=8, frameon=True)
+            ax2[err_ax2_i].legend(err_handles, err_labels, loc="lower left", fontsize=8, frameon=True)
 
             fig2.suptitle(
                 f"{scene_tag}  |  Accuracy={metrics['Accuracy']:.3f}  "
@@ -387,16 +445,15 @@ def plot_triptych(scene_tag, gt, pred, outdir, metrics, src_crs, src_transform, 
             fig2.savefig(zoom_png, bbox_inches="tight")
             plt.close(fig2)
         else:
-            print(f"[INFO] {scene_tag}: no focus pixels for crop ({zoom_mode}).")
+            print(f"[INFO] {scene_tag}: no focus pixels for crop ({ZOOM_MODE}).")
 
     return png_path, zoom_png
-
 
 
 def plot_confusion_matrix(cm, class_names, title, outpath):
     fig, ax = plt.subplots(figsize=(5, 5), dpi=DPI)
     im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
-    ax.figure.colorbar(im, ax=ax)
+    ax.figure.colorbar(im, ax)
     ax.set(xticks=np.arange(len(class_names)),
            yticks=np.arange(len(class_names)),
            xticklabels=class_names, yticklabels=class_names,
@@ -420,12 +477,12 @@ def main():
         print(f"No GT files in {GT_DIR}")
         return
 
-    # Determine class IDs by name for robust naming (handles mapping without changing indices)
+    # Determine class IDs by name for robust naming
     lake_id = next((k for k, v in CLASS_LABELS.items() if v.lower().startswith('lake')), 2)
     slush_id = next((k for k, v in CLASS_LABELS.items() if v.lower().startswith('slush')), 1)
 
     for gt_path in files:
-        name = os.path.basename(gt_path).replace(".tif", "")  # e.g., GT_Abbott_...
+        name = os.path.basename(gt_path).replace(".tif", "")
         scene_tag = name.replace("GT_", "")
 
         if "Abbott" in name:
@@ -476,10 +533,13 @@ def main():
                               outpath=cm_full_strat_path)
 
         # Figures: triptych (EPSG:3031) and full-scene confusion
-        triptych_path, zoom_path = plot_triptych(scene_tag, gt_arr, cl_arr, FIG_DIR, metrics_full,
-                                                 gt_crs, gt_transform, gt_shape,
-                                                 save_zoom=SAVE_ZOOM, zoom_mode=ZOOM_MODE,
-                                                 zoom_frac=ZOOM_FRAC, zoom_pad=ZOOM_PAD)
+        triptych_path, zoom_path = plot_triptych(
+            scene_tag, gt_arr, cl_arr, FIG_DIR, metrics_full,
+            gt_crs, gt_transform, gt_shape,
+            save_zoom=SAVE_ZOOM, zoom_mode=ZOOM_MODE,
+            zoom_frac=ZOOM_FRAC, zoom_pad=ZOOM_PAD, tcc_dir=TCC_DIR
+        )
+
         cm_full_path = os.path.join(FIG_DIR, f"confusion_fullscene_{scene_tag}.png")
         plot_confusion_matrix(full_cm, [CLASS_LABELS[c] for c in CLASSES],
                               title=f"{scene_tag} | Confusion (pixel counts, 3 classes)",
@@ -487,8 +547,10 @@ def main():
 
         ztxt = f", {os.path.basename(zoom_path)}" if zoom_path else ""
         print(
-            f"[OK] {scene_tag}: Acc={metrics_full['Accuracy']:.3f}, mIoU={metrics_full['Mean_IoU']:.3f}, "
-            f"Melt mIoU={metrics_full['Meltwater_mIoU']:.3f} → {triptych_path}{ztxt}, {cm_full_path}"
+            f"[OK] {scene_tag}: Acc={metrics_full['Accuracy']:.3f}, "
+            f"mIoU={metrics_full['Mean_IoU']:.3f}, "
+            f"Melt mIoU={metrics_full['Meltwater_mIoU']:.3f} "
+            f"→ {triptych_path}{ztxt}, {cm_full_path}"
         )
 
         # Row for FULL CSV
@@ -517,19 +579,22 @@ def main():
 
         # 2x2 confusion (raw pixel counts) over lakes/slush only
         cm_mw = compute_cm(gt_arr, cl_arr, MW_CLASSES, valid_mask=mw_valid)
-        # Stratified confusion over lakes/slush (sampled)
-        cm_mw_strat_path = os.path.join(FIG_DIR, f"confusion_meltwateronly_stratified_{scene_tag}.png")
+
+        # Save pixel-count CM (optional, follows your pattern)
         cm_mw_path = os.path.join(FIG_DIR, f"confusion_meltwateronly_{scene_tag}.png")
         plot_confusion_matrix(cm_mw, [CLASS_LABELS[c] for c in MW_CLASSES],
                               title=f"{scene_tag} | Confusion (pixel counts, lakes/slush)",
                               outpath=cm_mw_path)
+
         # Stratified sampling metrics for meltwater-only
         gt_s_mw, cl_s_mw = sample_pixels_stratified(gt_arr, cl_arr, mw_valid, SAMPLES_PER_CLASS, MW_CLASSES)
         if gt_s_mw.size == 0:
             print(f"[WARN] {scene_tag}: no meltwater-only samples; skipping MW metrics")
             continue
         cm_mw_strat, metrics_mw = metrics_from_sample(gt_s_mw, cl_s_mw, MW_CLASSES)
+
         # Save stratified (sample-based) confusion matrix for meltwater-only
+        cm_mw_strat_path = os.path.join(FIG_DIR, f"confusion_meltwateronly_stratified_{scene_tag}.png")
         plot_confusion_matrix(cm_mw_strat, [CLASS_LABELS[c] for c in MW_CLASSES],
                               title=f"{scene_tag} | Confusion (stratified sample, lakes/slush)",
                               outpath=cm_mw_strat_path)
@@ -538,7 +603,7 @@ def main():
         F1_lakes = metrics_mw.get(f"F1_class{lake_id}", np.nan)
         F1_slush = metrics_mw.get(f"F1_class{slush_id}", np.nan)
         F1_macro = np.nanmean([F1_lakes, F1_slush])
-        # weights from raw GT pixel counts within MW-valid mask
+
         gt_counts_mw = cm_mw.sum(axis=1).astype(float)
         weight_lake = gt_counts_mw[MW_CLASSES.index(lake_id)] / gt_counts_mw.sum() if gt_counts_mw.sum() else np.nan
         weight_slush = gt_counts_mw[MW_CLASSES.index(slush_id)] / gt_counts_mw.sum() if gt_counts_mw.sum() else np.nan
@@ -550,17 +615,14 @@ def main():
             "Scene": scene_tag,
             "Pair": f"{os.path.basename(gt_path)} vs {clf_desc}",
             "Total_valid_px_mw": int(gt_counts_mw.sum()),
-            # carry core metrics but computed over MW_CLASSES only
             "Accuracy": metrics_mw["Accuracy"],
             "Mean_IoU": metrics_mw["Mean_IoU"],
             "Kappa": metrics_mw["Kappa"],
-            # requested
             "F1_lakes": F1_lakes,
             "F1_slush": F1_slush,
             "F1_meltwater_macro": F1_macro,
             "F1_meltwater_weighted": F1_weighted,
         }
-        # also include per-class Prec/Rec/IoU for completeness
         for key in ["Prec", "Rec", "F1", "IoU"]:
             for cls in MW_CLASSES:
                 row_mw[f"{key}_class{cls}"] = metrics_mw.get(f"{key}_class{cls}", np.nan)
